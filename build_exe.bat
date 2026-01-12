@@ -6,6 +6,7 @@ if not exist .venv (
 call .venv\Scripts\activate
 pip install -r requirements.txt
 pyinstaller --onefile --noconsole --name "GiderHazirlamaFaz2" ^
+ --add-data "logo.png;." ^
  --collect-all numpy ^
  --collect-all pandas ^
  --collect-all lxml ^

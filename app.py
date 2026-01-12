@@ -6,6 +6,7 @@ import threading
 import queue
 import subprocess
 import unicodedata
+from copy import copy
 from pathlib import Path
 from datetime import datetime, timedelta
 
@@ -18,6 +19,9 @@ import requests
 from lxml import etree
 from openpyxl import load_workbook
 from openpyxl.utils.datetime import from_excel
+from openpyxl.styles import PatternFill
+from openpyxl.drawing.image import Image
+from openpyxl.utils import get_column_letter
 
 
 # =========================
@@ -255,11 +259,18 @@ def pdf_ocr_extract(pdf_path: Path, max_pages: int = 3) -> str:
         return ""
 
 
-def find_invoice_no(text: str) -> str:
+
+
+
+def find_invoice_no(text: str, log_callback=None) -> str:
     """
     PDF'den fatura numarasını bulur (normalize edilmiş değil, ham değer).
     normalize_invoice ile normalize edilmeli.
     """
+    def log(msg: str):
+        if log_callback:
+            log_callback(msg)
+    
     t = (text or "").upper()
 
     for pat in INVOICE_PATTERNS:
@@ -268,12 +279,16 @@ def find_invoice_no(text: str) -> str:
             cand = m.group(m.lastindex).strip()
             cand = cand.split("\n")[0].strip()
             cand = re.sub(r"[^A-Z0-9\-\/\. ]", "", cand).strip()
+            if cand:
+                log(f"[DEBUG] Found candidate in PDF: '{cand}'")
             return cand
 
     # Son çare: uzun alfanumerik aday (A612025000112251 gibi)
     candidates = re.findall(r"\b[A-Z]{0,3}\d{8,}\b", t)
     if candidates:
         candidates.sort(key=len, reverse=True)
+        for cand in candidates:
+            log(f"[DEBUG] Found candidate in PDF: '{cand}'")
         return candidates[0]
 
     return ""
@@ -348,13 +363,199 @@ def open_folder(path: Path):
         pass
 
 
+def add_company_header(ws, log_q: queue.Queue):
+    """
+    Excel sheet'inin en üstüne 3 satır ekler ve AntSis kurumsal başlığını ekler.
+    - A1:N3 aralığı #6396CB rengiyle doldurulur
+    - Logo D1:F3 alanına eklenir (varsa)
+    """
+    def log(msg: str):
+        log_q.put(msg)
+    
+    log("[BASLIK] AntSis kurumsal başlığı ekleniyor...")
+    
+    # En üste 3 satır ekle
+    ws.insert_rows(1, 3)
+    
+    # Mavi renk tanımı (#6396CB)
+    blue_fill = PatternFill(start_color="6396CB", end_color="6396CB", fill_type="solid")
+    
+    # Satır yüksekliklerini ayarla (başlık için daha yüksek) - önce bunu yap ki logo ölçeklendirme doğru olsun
+    ws.row_dimensions[1].height = 25
+    ws.row_dimensions[2].height = 25
+    ws.row_dimensions[3].height = 25
+    
+    # D, E, F sütunlarının genişliklerini ayarla (logo için yeterli alan)
+    ws.column_dimensions['D'].width = 15
+    ws.column_dimensions['E'].width = 15
+    ws.column_dimensions['F'].width = 15
+    
+    # A1:N3 aralığını mavi ile doldur
+    for row in range(1, 4):
+        for col in range(1, 15):  # A=1, N=14, range(1,15) = A'dan N'ye kadar
+            cell = ws.cell(row=row, column=col)
+            cell.fill = blue_fill
+    
+    # Logo dosyasını bul ve ekle (EXE uyumlu yol)
+    if getattr(sys, 'frozen', False):
+        base_dir = Path(sys._MEIPASS)
+    else:
+        base_dir = Path(__file__).parent
+    
+    logo_paths = [
+        base_dir / "logo.png",
+        base_dir / "logo.jpg",
+        base_dir / "logo.jpeg",
+        base_dir / "antsis_logo.png",
+        base_dir / "antsis_logo.jpg",
+    ]
+    
+    logo_path = None
+    for path in logo_paths:
+        if path.exists():
+            logo_path = path
+            break
+    
+    if logo_path:
+        try:
+            # D1:F3 hücrelerini merge et
+            ws.merge_cells('D1:F3')
+            
+            # Logo ekle
+            img = Image(str(logo_path))
+            
+            # D, E, F sütunlarının toplam genişliğini piksel cinsinden hesapla
+            # Excel'de 1 karakter genişliği ≈ 7 pixel, col_width karakter cinsinden
+            col_width_d = ws.column_dimensions['D'].width or 15
+            col_width_e = ws.column_dimensions['E'].width or 15
+            col_width_f = ws.column_dimensions['F'].width or 15
+            total_col_width = col_width_d + col_width_e + col_width_f
+            
+            # Satır yüksekliklerini piksel cinsinden hesapla
+            # Excel'de 1 point = 1.33 pixel
+            row_height_1 = ws.row_dimensions[1].height or 25
+            row_height_2 = ws.row_dimensions[2].height or 25
+            row_height_3 = ws.row_dimensions[3].height or 25
+            total_height_points = row_height_1 + row_height_2 + row_height_3
+            
+            # Piksel cinsinden hedef boyutlar
+            # Excel'de genişlik: total_col_width * 7 pixel (yaklaşık)
+            # Excel'de yükseklik: total_height_points * 1.33 pixel
+            target_width_px = total_col_width * 7
+            target_height_px = total_height_points * 1.33
+            
+            # Logo boyutunu hedef alana göre ölçekle (aspect ratio korunarak)
+            img_width, img_height = img.width, img.height
+            width_ratio = target_width_px / img_width
+            height_ratio = target_height_px / img_height
+            scale_ratio = min(width_ratio, height_ratio)  # En küçük oranı kullan
+            
+            img.width = int(img_width * scale_ratio)
+            img.height = int(img_height * scale_ratio)
+            
+            # Logo'yu D1 hücresine ekle
+            ws.add_image(img, 'D1')
+            
+            log(f"[BASLIK] ✅ Logo eklendi: {logo_path} (D1:F3, {img.width}x{img.height}px)")
+        except Exception as e:
+            log(f"[BASLIK] UYARI: Logo eklenirken hata: {e}")
+    else:
+        log("[BASLIK] UYARI: Logo dosyası bulunamadı (logo.png, logo.jpg, antsis_logo.png aranıyor)")
+    
+    # AutoFilter satırını 4. satıra ayarla (başlık 1-3, header 4)
+    from openpyxl.utils import get_column_letter
+    ws.auto_filter.ref = f"A4:{get_column_letter(ws.max_column)}4"
+    
+    log("[BASLIK] ✅ Başlık eklendi (A1:N3 mavi #6396CB)")
+
+
+def apply_excel_formatting(ws, log_q: queue.Queue):
+    """
+    Excel sheet'ine renk formatlaması uygular.
+    - 4. satır A'dan U'ya kadar gri (#E5E7EB)
+    - Veri satırları (5'ten son dolu satıra kadar) belirli kolonlara renkler uygular
+    """
+    def log(msg: str):
+        log_q.put(msg)
+    
+    log("[FORMAT] Excel formatlaması uygulanıyor...")
+    
+    # Renk tanımları
+    gray_fill = PatternFill(start_color="E5E7EB", end_color="E5E7EB", fill_type="solid")
+    light_green_fill = PatternFill(start_color="D9F2D9", end_color="D9F2D9", fill_type="solid")
+    light_yellow_fill = PatternFill(start_color="FFF4CC", end_color="FFF4CC", fill_type="solid")
+    light_blue_fill = PatternFill(start_color="DCEBFA", end_color="DCEBFA", fill_type="solid")
+    light_orange_fill = PatternFill(start_color="FFE0B3", end_color="FFE0B3", fill_type="solid")
+    light_pink_fill = PatternFill(start_color="F8D7DA", end_color="F8D7DA", fill_type="solid")
+    
+    # 1) 4. satır A'dan U'ya kadar gri
+    for col in range(1, 22):  # A=1, U=21, range(1,22) = A'dan U'ye kadar
+        cell = ws.cell(row=4, column=col)
+        cell.fill = gray_fill
+    
+    log("[FORMAT] 4. satır (header) gri renklendirildi (A4:U4)")
+    
+    # 2) Son dolu satırı bul (veri satırları 5'ten başlar)
+    last_data_row = 4  # Header satır 4
+    for row in range(5, ws.max_row + 1):
+        # Herhangi bir sütunda değer varsa bu satır veri satırıdır
+        has_data = False
+        for col in range(1, ws.max_column + 1):
+            cell = ws.cell(row=row, column=col)
+            if cell.value is not None:
+                has_data = True
+                break
+        if has_data:
+            last_data_row = row
+    
+    log(f"[FORMAT] Son veri satırı: {last_data_row}")
+    
+    # 3) Veri satırlarını renklendir (5'ten last_data_row'a kadar)
+    if last_data_row >= 5:
+        # Kolon harflerini sayıya çevir
+        col_map = {
+            'B': 2, 'C': 3, 'F': 6, 'I': 9, 'J': 10, 'K': 11, 'L': 12, 'M': 13, 'N': 14, 'Q': 17
+        }
+        
+        # Renk atamaları
+        color_assignments = {
+            # B ve K → açık yeşil
+            2: light_green_fill,   # B
+            11: light_green_fill,  # K
+            # C ve J → açık sarı
+            3: light_yellow_fill,   # C
+            10: light_yellow_fill,  # J
+            # F ve N → açık mavi
+            6: light_blue_fill,     # F
+            14: light_blue_fill,   # N
+            # I, M ve Q → açık turuncu
+            9: light_orange_fill,   # I
+            13: light_orange_fill,  # M
+            17: light_orange_fill, # Q
+            # L → açık pembe
+            12: light_pink_fill,    # L
+        }
+        
+        # Her veri satırını işle
+        for row in range(5, last_data_row + 1):
+            for col_num, fill_color in color_assignments.items():
+                cell = ws.cell(row=row, column=col_num)
+                cell.fill = fill_color
+        
+        log(f"[FORMAT] Veri satırları renklendirildi (5-{last_data_row}): B,K=yeşil, C,J=sarı, F,N=mavi, I,M,Q=turuncu, L=pembe")
+    else:
+        log("[FORMAT] UYARI: Veri satırı bulunamadı")
+    
+    log("[FORMAT] ✅ Formatlama tamamlandı")
+
+
 def calculate_rates_on_output_excel(excel_path: Path, log_q: queue.Queue) -> int:
     """
     Faz-2'nin oluşturduğu output Excel üzerinde kur ve USD tutarı hesaplar.
     
     Akış:
     1) new_excel aç
-    2) wb.active (tek sheet) seç
+    2) wb.active (output Excel'de tek sheet - Sheet1) seç
     3) D sütunundan tarih oku (datetime olarak, parse yok)
     4) TCMB'den bir önceki iş günü USD alış kurunu bul
     5) U sütununa kur yaz
@@ -366,16 +567,16 @@ def calculate_rates_on_output_excel(excel_path: Path, log_q: queue.Queue) -> int
     
     log(f"[KUR-HESAP] Excel açılıyor: {excel_path}")
     
-    # Faz-2'nin oluşturduğu Excel'i aç
+    # Faz-2'nin oluşturduğu Excel'i aç (output Excel, tek sheet - Sheet1)
     wb = load_workbook(excel_path, data_only=True)
-    ws = wb.active  # Tek sheet (Sheet1)
+    ws = wb.active
     
     log(f"[KUR-HESAP] Sheet: {ws.title}")
     
     fx_rows = 0
     
-    # Tüm satırları dolaş (header satır 1, data satırları 2'den başlar)
-    for excel_row in range(2, ws.max_row + 1):
+    # Tüm satırları dolaş (başlık satırları 1-3, header satır 4, data satırları 5'ten başlar)
+    for excel_row in range(5, ws.max_row + 1):
         # D sütunu: Fatura tarihi - string, datetime veya serial number olabilir
         date_cell = ws[f"{COL_D}{excel_row}"]
         raw = date_cell.value
@@ -444,23 +645,23 @@ def calculate_rates_on_output_excel(excel_path: Path, log_q: queue.Queue) -> int
         fx_rows += 1
     
     # En son veri satırını tespit et (T sütununda değer olan son satır)
-    last_data_row = 1  # Header satır 1
-    for row in range(2, ws.max_row + 1):
+    last_data_row = 4  # Header satır 4 (başlık 1-3, header 4)
+    for row in range(5, ws.max_row + 1):
         t_cell = ws[f"{COL_T}{row}"]
         if t_cell.value is not None:
             last_data_row = row
     
     # Dip toplam ekle: Son veri satırından sonra 3 boş satır, sonra TOPLAM
-    if fx_rows > 0 and last_data_row > 1:
+    if fx_rows > 0 and last_data_row > 4:
         total_row = last_data_row + 4  # Son veri satırı + 3 boş + 1 (TOPLAM satırı)
         
         # Sol hücreye "TOPLAM" yaz (A sütununa veya ilk görünür sütuna)
         # Genelde T sütununun solunda bir hücre olur, burada B sütununu kullanabiliriz
         ws[f"B{total_row}"].value = "TOPLAM"
         
-        # T sütununa toplam formülü ekle: =SUM(T2:T<last_data_row>)
+        # T sütununa toplam formülü ekle: =SUM(T5:T<last_data_row>) (veri 5'ten başlar)
         t_total_cell = ws[f"{COL_T}{total_row}"]
-        t_total_cell.value = f"=SUM(T2:T{last_data_row})"
+        t_total_cell.value = f"=SUM(T5:T{last_data_row})"
         # TOPLAM hücresine de 2 ondalık formatı ekle
         t_total_cell.number_format = "#,##0.00"
         
@@ -488,7 +689,7 @@ def process_all(excel_path: Path, pdf_paths: list[Path], out_dir: Path, log_q: q
     
     # Excel'i openpyxl ile açarak K sütununu string olarak oku
     wb = load_workbook(excel_path, data_only=True)
-    ws = wb.active
+    ws = wb["Tümü"]
     
     idx_B = col_letter_to_idx(COL_B)
     idx_D = col_letter_to_idx(COL_D)
@@ -536,6 +737,8 @@ def process_all(excel_path: Path, pdf_paths: list[Path], out_dir: Path, log_q: q
     matched = 0
 
     for n, pdf_path in enumerate(pdf_paths, start=1):
+        pdf_filename = os.path.splitext(pdf_path.name)[0]
+        log(f"[DEBUG] Processing PDF: {pdf_filename}")
         log(f"[PDF] ({n}/{total}) {pdf_path.name}")
 
         text = pdf_text_extract(pdf_path, max_pages=5)
@@ -550,50 +753,55 @@ def process_all(excel_path: Path, pdf_paths: list[Path], out_dir: Path, log_q: q
                     dest = out_dir / FOLDER_UNMATCHED / pdf_path.name
                     shutil.copy2(pdf_path, dest)
                     log("[MATCH] metin yok + OCR yok -> eşleşmedi")
+                    log(f"[DEBUG] UNMATCHED PDF: {pdf_filename}")
                     continue
 
-        inv_no_raw = find_invoice_no(text)
+        # 1) PDF içinden gerçek invoice numarasını oku → normalize et → Excel K sütununda ara
+        inv_no_raw = find_invoice_no(text, log_callback=log)
         inv_no = normalize_invoice(inv_no_raw) if inv_no_raw else ""
         
-        # Eğer bulunan fatura no Excel'de yoksa, fallback regex ile tekrar dene
-        if inv_no and inv_no not in invoice_to_excel_row:
-            fallback = re.findall(r"[A-Z]{2,5}[0-9]{8,}", text.upper())
-            if fallback:
-                fallback.sort(key=len, reverse=True)
-                inv_no_fallback = normalize_invoice(fallback[0])
-                if inv_no_fallback in invoice_to_excel_row:
-                    log(f"[FIX] Regex fallback kullanıldı: {inv_no} -> {inv_no_fallback}")
-                    inv_no = inv_no_fallback
+        excel_row = None
         
-        if not inv_no:
-            dest = out_dir / FOLDER_UNMATCHED / pdf_path.name
-            shutil.copy2(pdf_path, dest)
-            log("[MATCH] fatura no bulunamadı -> eşleşmedi")
-            continue
-
-        excel_row = invoice_to_excel_row.get(inv_no)
+        if inv_no:
+            excel_row = invoice_to_excel_row.get(inv_no)
+            if excel_row:
+                log(f"[DEBUG] Trying Excel row={excel_row} invoice='{inv_no}' vs PDF")
+            else:
+                # K'da yok -> başarısız say -> filename'e geç
+                inv_no = ""
         
-        # Son çare: PDF dosya adından fatura no ile dene
+        # 2) Bulamazsan: PDF dosya adından invoice çıkar → normalize et → Excel K sütununda ara
+        # 2) Bulamazsan: PDF dosya adından invoice çıkar → normalize et → Excel K sütununda ara
         if excel_row is None:
             filename = os.path.splitext(os.path.basename(str(pdf_path)))[0]  # AVA2025000441018
             filename_norm = normalize_invoice(filename)
+            log(f"[DEBUG] Filename match try: {pdf_filename}")
             
-            if filename_norm in invoice_to_excel_row:
-                excel_row = invoice_to_excel_row[filename_norm]
-                log(f"[FIX-FILENAME] PDF adı ile eşleşti: {inv_no} -> {filename_norm} (satır {excel_row})")
+            excel_row_candidate = invoice_to_excel_row.get(filename_norm)
+            if excel_row_candidate:
+                log(f"[DEBUG] Trying Excel row={excel_row_candidate} invoice='{filename_norm}' vs PDF (filename)")
+                log(f"[DEBUG] Filename matched invoice='{filename_norm}'")
+                excel_row = excel_row_candidate
+                inv_no = filename_norm
+                log(f"[FIX-FILENAME] PDF adı ile eşleşti: {inv_no_raw} -> {filename_norm} (satır {excel_row})")
         
         if excel_row is None:
             dest = out_dir / FOLDER_UNMATCHED / pdf_path.name
             shutil.copy2(pdf_path, dest)
             log(f"[MATCH] Excel'de yok inv={inv_no} -> eşleşmedi")
+            log(f"[DEBUG] UNMATCHED PDF: {pdf_filename}")
             continue
-
+        
+        # Seçim anı
+        log(f"[DEBUG] SELECTED invoice='{inv_no}' from row={excel_row}")
+        
         # DataFrame index'ini bul
         df_idx = excel_row_to_df_idx.get(excel_row)
         if df_idx is None:
             dest = out_dir / FOLDER_UNMATCHED / pdf_path.name
             shutil.copy2(pdf_path, dest)
             log(f"[MATCH] Excel satır {excel_row} DataFrame'de bulunamadı -> eşleşmedi")
+            log(f"[DEBUG] UNMATCHED PDF: {pdf_filename}")
             continue
 
         # N sütunu (etiket) - PDF kopyalanmadan hemen önce doğrudan oku ve klasör hesapla
@@ -639,14 +847,24 @@ def process_all(excel_path: Path, pdf_paths: list[Path], out_dir: Path, log_q: q
     # Aktif sekmenin adını "Sheet1" yap (default tek sheet)
     ws.title = "Sheet1"
     
-    # A sütunundan ay bilgisini al (A2 hücresi)
-    month_cell = ws["A2"]
+    # AntSis kurumsal başlığını ekle (en üste 3 satır)
+    add_company_header(ws, log_q)
+    
+    # Excel formatlamasını uygula
+    apply_excel_formatting(ws, log_q)
+    
+    # A sütunundan ay bilgisini al (artık A5 hücresi, çünkü 3 satır eklendi)
+    month_cell = ws["A5"]
     month = ""
     if month_cell.value is not None:
         month = str(month_cell.value).strip().upper()
     else:
-        log("[FAZ-2] UYARI: A2 hücresi boş, varsayılan isim kullanılıyor")
+        log("[FAZ-2] UYARI: A5 hücresi boş, varsayılan isim kullanılıyor")
         month = "AY"
+    
+    # Üst 4 satırı sabitle (freeze_panes)
+    ws.freeze_panes = "A5"
+    log("[FAZ-2] Üst 4 satır sabitlendi (freeze_panes = A5)")
     
     # Output Excel dosya adı: gider_kalemleri_<AY>_2025_faz2.xlsx
     output_filename = f"gider_kalemleri_{month}_2025_faz2.xlsx"
@@ -668,7 +886,190 @@ def process_all(excel_path: Path, pdf_paths: list[Path], out_dir: Path, log_q: q
     
     log("--------------------------------------------------")
     log(f"[DONE] Döviz yazılan satır: {fx_rows}")
+    
+    # Faz-4: Klasör bazlı Excel üretimi
+    log("[FAZ-4] Klasör bazlı Excel dosyaları oluşturuluyor...")
+    create_folder_excels_from_master(out_excel, out_dir, VALID_TAGS, month, "2025", log_q)
+    
+    log("--------------------------------------------------")
     log("[DONE] İşlem bitti.")
+
+
+def clone_and_filter_workbook(master_path: Path, output_path: Path, target_tag: str, log_q: queue.Queue) -> bool:
+    """
+    Master Excel'i dosya seviyesinde kopyalar ve belirli bir etiket için filtreler.
+    
+    Args:
+        master_path: Master Excel dosya yolu
+        output_path: Çıktı Excel dosya yolu
+        target_tag: Hedef etiket (N sütununda aranacak)
+        log_q: Log kuyruğu
+    
+    Returns:
+        bool: Başarılı ise True
+    """
+    def log(msg: str):
+        log_q.put(msg)
+    
+    try:
+        # 1) Master Excel'i dosya seviyesinde kopyala (shutil.copy)
+        log(f"[KLASOR-EXCEL] Master Excel kopyalanıyor: {target_tag}")
+        shutil.copy(master_path, output_path)
+        log(f"[KLASOR-EXCEL] Dosya kopyalandı: {output_path}")
+        
+        # 2) Kopya üzerinden openpyxl ile aç
+        wb = load_workbook(output_path, data_only=False)
+        ws = wb.active
+        
+        # 3) Son veri satırını bul (dip toplam dahil)
+        last_data_row = 4  # Header satır 4
+        for row in range(5, ws.max_row + 1):
+            # TOPLAM kelimesi içeren satırları bul (dip toplam)
+            has_total = False
+            for col in range(1, ws.max_column + 1):
+                cell = ws.cell(row=row, column=col)
+                if cell.value and isinstance(cell.value, str) and "TOPLAM" in str(cell.value).upper():
+                    has_total = True
+                    break
+            
+            if has_total:
+                last_data_row = row
+                break
+            
+            # Normal veri satırı kontrolü
+            has_data = False
+            for col in range(1, ws.max_column + 1):
+                cell = ws.cell(row=row, column=col)
+                if cell.value is not None:
+                    has_data = True
+                    break
+            if has_data:
+                last_data_row = row
+        
+        log(f"[KLASOR-EXCEL] Son veri satırı: {last_data_row} (etiket: {target_tag})")
+        
+        # 4) 5. satırdan last_data_row'a kadar filtreleme yap
+        # Geriye doğru sil ki satır numaraları kaymasın
+        rows_to_delete = []
+        for row in range(5, last_data_row + 1):
+            # N sütunundaki etiketi oku
+            n_cell = ws[f"{COL_N}{row}"]
+            cell_tag = ""
+            if n_cell.value is not None:
+                cell_tag = str(n_cell.value).strip().lower()
+            
+            # Etiket normalizasyonu (master Excel'deki gibi)
+            normalized_tag = normalize_tag(cell_tag)
+            
+            # Hedef etiketi normalize et
+            target_tag_normalized = normalize_tag(target_tag)
+            
+            # Eşleşmiyorsa silinecek satırlar listesine ekle
+            if normalized_tag != target_tag_normalized:
+                rows_to_delete.append(row)
+        
+        # Satırları geriye doğru sil
+        for row in reversed(rows_to_delete):
+            ws.delete_rows(row)
+        
+        log(f"[KLASOR-EXCEL] {len(rows_to_delete)} satır silindi (etiket: {target_tag})")
+        
+        # 5) N'den sonraki kolonları kaldır (N=14, O'dan başla)
+        if ws.max_column > 14:  # N=14
+            ws.delete_cols(15, ws.max_column - 14)
+            log(f"[KLASOR-EXCEL] N'den sonraki kolonlar kaldırıldı (etiket: {target_tag})")
+        
+        # 6) Son veri satırını yeniden bul (satır silme sonrası)
+        last_data_row = 4  # Header satır 4
+        for row in range(5, ws.max_row + 1):
+            has_data = False
+            for col in range(1, ws.max_column + 1):
+                cell = ws.cell(row=row, column=col)
+                if cell.value is not None:
+                    has_data = True
+                    break
+            if has_data:
+                last_data_row = row
+        
+        log(f"[KLASOR-EXCEL] Filtreleme sonrası son veri satırı: {last_data_row} (etiket: {target_tag})")
+        
+        # 7) Dip toplam ekle (I, L, M kolonları)
+        if last_data_row >= 5:
+            total_row = last_data_row + 4  # 3 boş satır + toplam satırı
+            
+            # B kolonuna "TOPLAM" yaz
+            ws[f"B{total_row}"].value = "TOPLAM"
+            
+            # I, L, M kolonlarına toplam formülleri ekle
+            ws[f"I{total_row}"].value = f"=SUM(I5:I{last_data_row})"
+            ws[f"L{total_row}"].value = f"=SUM(L5:L{last_data_row})"
+            ws[f"M{total_row}"].value = f"=SUM(M5:M{last_data_row})"
+            
+            # Toplam satırına sayı formatı ekle
+            ws[f"I{total_row}"].number_format = "#,##0.00"
+            ws[f"L{total_row}"].number_format = "#,##0.00"
+            ws[f"M{total_row}"].number_format = "#,##0.00"
+            
+            log(f"[KLASOR-EXCEL] Dip toplam eklendi: Satır {total_row}, I{total_row}, L{total_row}, M{total_row} (etiket: {target_tag})")
+        
+        # 8) AutoFilter'ı A4:N4 olarak ayarla (kolon silme işleminden sonra)
+        ws.auto_filter.ref = "A4:N4"
+        log(f"[KLASOR-EXCEL] AutoFilter A4:N4 olarak ayarlandı (etiket: {target_tag})")
+        
+        # 9) Üst 4 satırı sabitle (freeze_panes)
+        ws.freeze_panes = "A5"
+        log(f"[KLASOR-EXCEL] Üst 4 satır sabitlendi (freeze_panes = A5) (etiket: {target_tag})")
+        
+        # 10) Kaydet
+        wb.save(output_path)
+        wb.close()
+        
+        log(f"[KLASOR-EXCEL] ✅ Alt Excel kaydedildi: {output_path} (etiket: {target_tag})")
+        return True
+        
+    except Exception as e:
+        log(f"[KLASOR-EXCEL] HATA ({target_tag}): {e}")
+        return False
+
+
+def create_folder_excels_from_master(master_excel_path: Path, base_output_dir: Path, tags: list[str], month_str: str, year: str, log_q: queue.Queue):
+    """
+    Master Excel'den her etiket klasörü için ayrı Excel dosyaları oluşturur.
+    
+    Args:
+        master_excel_path: Master Excel dosya yolu
+        base_output_dir: Ana çıktı klasörü
+        tags: Etiket listesi (klasör adları)
+        month_str: Ay bilgisi (dosya adı için)
+        year: Yıl bilgisi (dosya adı için)
+        log_q: Log kuyruğu
+    """
+    def log(msg: str):
+        log_q.put(msg)
+    
+    log(f"[KLASOR-EXCEL] Master Excel'den klasör bazlı Excel'ler oluşturuluyor...")
+    log(f"[KLASOR-EXCEL] Master: {master_excel_path}")
+    
+    created_count = 0
+    
+    for tag in tags:
+        # Klasör yolunu oluştur
+        folder_path = base_output_dir / tag
+        
+        # Klasör yoksa oluştur
+        folder_path.mkdir(parents=True, exist_ok=True)
+        
+        # Dosya adı: gider_kalemleri_<Ay>_<Yıl>_<etiket>.xlsx
+        output_filename = f"gider_kalemleri_{month_str}_{year}_{tag}.xlsx"
+        output_path = folder_path / output_filename
+        
+        # Alt Excel oluştur
+        if clone_and_filter_workbook(master_excel_path, output_path, tag, log_q):
+            created_count += 1
+        else:
+            log(f"[KLASOR-EXCEL] UYARI: {tag} için Excel oluşturulamadı")
+    
+    log(f"[KLASOR-EXCEL] ✅ {created_count}/{len(tags)} klasör Excel'i oluşturuldu")
 
 
 # =========================
