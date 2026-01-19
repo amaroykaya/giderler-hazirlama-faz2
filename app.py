@@ -644,28 +644,33 @@ def calculate_rates_on_output_excel(excel_path: Path, log_q: queue.Queue) -> int
         log(f"[KUR-HESAP] Satır {excel_row}: ✅ U={usd_rate:.4f} kur yazıldı, T={usd_amount:.2f} USD yazıldı (M={m_value:.2f} TL / {usd_rate:.4f})")
         fx_rows += 1
     
-    # En son veri satırını tespit et (T sütununda değer olan son satır)
+    # En son veri satırını tespit et (SADECE A sütununa bakarak)
     last_data_row = 4  # Header satır 4 (başlık 1-3, header 4)
     for row in range(5, ws.max_row + 1):
-        t_cell = ws[f"{COL_T}{row}"]
-        if t_cell.value is not None:
+        a_cell = ws[f"A{row}"]
+        if a_cell.value is not None:
             last_data_row = row
     
-    # Dip toplam ekle: Son veri satırından sonra 3 boş satır, sonra TOPLAM
-    if fx_rows > 0 and last_data_row > 4:
-        total_row = last_data_row + 4  # Son veri satırı + 3 boş + 1 (TOPLAM satırı)
+    # Dip toplam ekle: Son veri satırından sonra 3 boş satır, sonra TOPLAM (tek satır)
+    if last_data_row > 4:
+        total_row = last_data_row + 3  # Son veri satırı + 3 boş satır (toplam satırı)
+        data_start = 5  # Veri 5. satırdan başlar
         
-        # Sol hücreye "TOPLAM" yaz (A sütununa veya ilk görünür sütuna)
-        # Genelde T sütununun solunda bir hücre olur, burada B sütununu kullanabiliriz
-        ws[f"B{total_row}"].value = "TOPLAM"
+        # I, L, M, Q, T kolonlarında formüllü dip toplam
+        ws[f"I{total_row}"].value = f"=SUM(I{data_start}:I{last_data_row})"
+        ws[f"L{total_row}"].value = f"=SUM(L{data_start}:L{last_data_row})"
+        ws[f"M{total_row}"].value = f"=SUM(M{data_start}:M{last_data_row})"
+        ws[f"Q{total_row}"].value = f"=SUM(Q{data_start}:Q{last_data_row})"
+        ws[f"T{total_row}"].value = f"=SUM(T{data_start}:T{last_data_row})"
         
-        # T sütununa toplam formülü ekle: =SUM(T5:T<last_data_row>) (veri 5'ten başlar)
-        t_total_cell = ws[f"{COL_T}{total_row}"]
-        t_total_cell.value = f"=SUM(T5:T{last_data_row})"
-        # TOPLAM hücresine de 2 ondalık formatı ekle
-        t_total_cell.number_format = "#,##0.00"
+        # Sayı formatı ekle
+        ws[f"I{total_row}"].number_format = "#,##0.00"
+        ws[f"L{total_row}"].number_format = "#,##0.00"
+        ws[f"M{total_row}"].number_format = "#,##0.00"
+        ws[f"Q{total_row}"].number_format = "#,##0.00"
+        ws[f"T{total_row}"].number_format = "#,##0.00"
         
-        log(f"[KUR-HESAP] Dip toplam eklendi: Satır {total_row}, T{total_row} =SUM(T2:T{last_data_row})")
+        log(f"[KUR-HESAP] Dip toplam eklendi: Satır {total_row}, I{total_row}, L{total_row}, M{total_row}, Q{total_row}, T{total_row}")
     
     # Kaydet
     log(f"[KUR-HESAP] {fx_rows} satır için kur hesaplandı, Excel kaydediliyor...")
@@ -795,14 +800,10 @@ def process_all(excel_path: Path, pdf_paths: list[Path], out_dir: Path, log_q: q
         # Seçim anı
         log(f"[DEBUG] SELECTED invoice='{inv_no}' from row={excel_row}")
         
-        # DataFrame index'ini bul
+        # DataFrame index kontrolü (sadece log/uyarı amaçlı, eşleşmeyi iptal etmez)
         df_idx = excel_row_to_df_idx.get(excel_row)
         if df_idx is None:
-            dest = out_dir / FOLDER_UNMATCHED / pdf_path.name
-            shutil.copy2(pdf_path, dest)
-            log(f"[MATCH] Excel satır {excel_row} DataFrame'de bulunamadı -> eşleşmedi")
-            log(f"[DEBUG] UNMATCHED PDF: {pdf_filename}")
-            continue
+            log(f"[UYARI] Excel satır {excel_row} DataFrame mapping'inde bulunamadı (eşleşme devam ediyor)")
 
         # N sütunu (etiket) - PDF kopyalanmadan hemen önce doğrudan oku ve klasör hesapla
         n_cell = ws[f"{COL_N}{excel_row}"]
@@ -825,7 +826,18 @@ def process_all(excel_path: Path, pdf_paths: list[Path], out_dir: Path, log_q: q
         # inv_no zaten normalize_invoice ile normalize edilmiş
         new_name = f"{b_value}-{inv_no}.pdf"
         
-        dest = out_dir / folder / new_name
+        # PDF hedef klasörünü belirle
+        if folder == FOLDER_UNMATCHED:
+            # Eşleşmedi klasörü: direkt klasöre kopyala
+            dest_dir = out_dir / FOLDER_UNMATCHED
+        else:
+            # Etiket klasörü: {etiket}_fat alt klasörüne kopyala
+            dest_dir = out_dir / folder / f"{folder}_fat"
+        
+        # Klasörü oluştur (yoksa)
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        
+        dest = dest_dir / new_name
         shutil.copy2(pdf_path, dest)
 
         matched += 1
@@ -862,10 +874,6 @@ def process_all(excel_path: Path, pdf_paths: list[Path], out_dir: Path, log_q: q
         log("[FAZ-2] UYARI: A5 hücresi boş, varsayılan isim kullanılıyor")
         month = "AY"
     
-    # Üst 4 satırı sabitle (freeze_panes)
-    ws.freeze_panes = "A5"
-    log("[FAZ-2] Üst 4 satır sabitlendi (freeze_panes = A5)")
-    
     # Output Excel dosya adı: gider_kalemleri_<AY>_2025_faz2.xlsx
     output_filename = f"gider_kalemleri_{month}_2025_faz2.xlsx"
     out_excel = out_dir / output_filename
@@ -886,6 +894,16 @@ def process_all(excel_path: Path, pdf_paths: list[Path], out_dir: Path, log_q: q
     
     log("--------------------------------------------------")
     log(f"[DONE] Döviz yazılan satır: {fx_rows}")
+    
+    # Master Excel için freeze ve viewport ayarları - EN SON işlem (calculate_rates_on_output_excel tamamlandıktan sonra)
+    wb_final = load_workbook(out_excel, data_only=False)
+    ws_final = wb_final.active
+    ws_final.freeze_panes = "A5"
+    ws_final.sheet_view.topLeftCell = "A1"
+    ws_final.sheet_view.selection[0].activeCell = "A1"
+    ws_final.sheet_view.selection[0].sqref = "A1"
+    wb_final.save(out_excel)
+    wb_final.close()
     
     # Faz-4: Klasör bazlı Excel üretimi
     log("[FAZ-4] Klasör bazlı Excel dosyaları oluşturuluyor...")
@@ -952,20 +970,56 @@ def clone_and_filter_workbook(master_path: Path, output_path: Path, target_tag: 
         # Geriye doğru sil ki satır numaraları kaymasın
         rows_to_delete = []
         for row in range(5, last_data_row + 1):
-            # N sütunundaki etiketi oku
+            should_delete = False
+            
+            # Kontrol 1: N sütunu (Etiket) boş mu?
             n_cell = ws[f"{COL_N}{row}"]
-            cell_tag = ""
+            n_value = ""
             if n_cell.value is not None:
-                cell_tag = str(n_cell.value).strip().lower()
+                n_value = str(n_cell.value).strip()
             
-            # Etiket normalizasyonu (master Excel'deki gibi)
-            normalized_tag = normalize_tag(cell_tag)
+            if not n_value:
+                should_delete = True
+                log(f"[KLASOR-EXCEL] Satır {row} silinecek: Etiket (N sütunu) boş")
             
-            # Hedef etiketi normalize et
-            target_tag_normalized = normalize_tag(target_tag)
+            # Kontrol 2: K sütunu (Fatura No) boş mu?
+            if not should_delete:
+                k_cell = ws[f"{COL_K}{row}"]
+                k_value = ""
+                if k_cell.value is not None:
+                    k_value = str(k_cell.value).strip()
+                
+                if not k_value:
+                    should_delete = True
+                    log(f"[KLASOR-EXCEL] Satır {row} silinecek: Fatura No (K sütunu) boş")
             
-            # Eşleşmiyorsa silinecek satırlar listesine ekle
-            if normalized_tag != target_tag_normalized:
+            # Kontrol 3: Herhangi bir hücresinde "TOPLAM" geçiyor mu?
+            if not should_delete:
+                has_total = False
+                for col in range(1, ws.max_column + 1):
+                    cell = ws.cell(row=row, column=col)
+                    if cell.value and isinstance(cell.value, str) and "TOPLAM" in str(cell.value).upper():
+                        has_total = True
+                        break
+                
+                if has_total:
+                    should_delete = True
+                    log(f"[KLASOR-EXCEL] Satır {row} silinecek: 'TOPLAM' içeriyor")
+            
+            # Kontrol 4: Etiket eşleşmesi (sadece yukarıdaki kontroller geçtiyse)
+            if not should_delete:
+                cell_tag = n_value.lower()
+                # Etiket normalizasyonu (master Excel'deki gibi)
+                normalized_tag = normalize_tag(cell_tag)
+                
+                # Hedef etiketi normalize et
+                target_tag_normalized = normalize_tag(target_tag)
+                
+                # Eşleşmiyorsa silinecek satırlar listesine ekle
+                if normalized_tag != target_tag_normalized:
+                    should_delete = True
+            
+            if should_delete:
                 rows_to_delete.append(row)
         
         # Satırları geriye doğru sil
@@ -974,7 +1028,11 @@ def clone_and_filter_workbook(master_path: Path, output_path: Path, target_tag: 
         
         log(f"[KLASOR-EXCEL] {len(rows_to_delete)} satır silindi (etiket: {target_tag})")
         
-        # 5) N'den sonraki kolonları kaldır (N=14, O'dan başla)
+        # 5) G ve H sütunlarını sil (G=7, H=8)
+        ws.delete_cols(7, 2)
+        log(f"[KLASOR-EXCEL] G ve H sütunları silindi (etiket: {target_tag})")
+        
+        # 6) N'den sonraki kolonları kaldır (N=14, O'dan başla)
         if ws.max_column > 14:  # N=14
             ws.delete_cols(15, ws.max_column - 14)
             log(f"[KLASOR-EXCEL] N'den sonraki kolonlar kaldırıldı (etiket: {target_tag})")
@@ -993,32 +1051,34 @@ def clone_and_filter_workbook(master_path: Path, output_path: Path, target_tag: 
         
         log(f"[KLASOR-EXCEL] Filtreleme sonrası son veri satırı: {last_data_row} (etiket: {target_tag})")
         
-        # 7) Dip toplam ekle (I, L, M kolonları)
+        # 7) Dip toplam ekle (G, J, K kolonları - G ve H silindikten sonra)
         if last_data_row >= 5:
             total_row = last_data_row + 4  # 3 boş satır + toplam satırı
             
             # B kolonuna "TOPLAM" yaz
             ws[f"B{total_row}"].value = "TOPLAM"
             
-            # I, L, M kolonlarına toplam formülleri ekle
-            ws[f"I{total_row}"].value = f"=SUM(I5:I{last_data_row})"
-            ws[f"L{total_row}"].value = f"=SUM(L5:L{last_data_row})"
-            ws[f"M{total_row}"].value = f"=SUM(M5:M{last_data_row})"
+            # G, J, K kolonlarına toplam formülleri ekle (G ve H silindikten sonra yeni harfler)
+            ws[f"G{total_row}"].value = f"=SUM(G5:G{last_data_row})"
+            ws[f"J{total_row}"].value = f"=SUM(J5:J{last_data_row})"
+            ws[f"K{total_row}"].value = f"=SUM(K5:K{last_data_row})"
             
             # Toplam satırına sayı formatı ekle
-            ws[f"I{total_row}"].number_format = "#,##0.00"
-            ws[f"L{total_row}"].number_format = "#,##0.00"
-            ws[f"M{total_row}"].number_format = "#,##0.00"
+            ws[f"G{total_row}"].number_format = "#,##0.00"
+            ws[f"J{total_row}"].number_format = "#,##0.00"
+            ws[f"K{total_row}"].number_format = "#,##0.00"
             
-            log(f"[KLASOR-EXCEL] Dip toplam eklendi: Satır {total_row}, I{total_row}, L{total_row}, M{total_row} (etiket: {target_tag})")
+            log(f"[KLASOR-EXCEL] Dip toplam eklendi: Satır {total_row}, G{total_row}, J{total_row}, K{total_row} (etiket: {target_tag})")
         
-        # 8) AutoFilter'ı A4:N4 olarak ayarla (kolon silme işleminden sonra)
-        ws.auto_filter.ref = "A4:N4"
-        log(f"[KLASOR-EXCEL] AutoFilter A4:N4 olarak ayarlandı (etiket: {target_tag})")
+        # 8) AutoFilter'ı A4:K4 olarak ayarla (kolon silme işleminden sonra)
+        ws.auto_filter.ref = "A4:K4"
+        log(f"[KLASOR-EXCEL] AutoFilter A4:K4 olarak ayarlandı (etiket: {target_tag})")
         
-        # 9) Üst 4 satırı sabitle (freeze_panes)
+        # 9) İlk 4 satırı dondur ve viewport ayarları
         ws.freeze_panes = "A5"
-        log(f"[KLASOR-EXCEL] Üst 4 satır sabitlendi (freeze_panes = A5) (etiket: {target_tag})")
+        ws.sheet_view.topLeftCell = "A1"
+        ws.sheet_view.selection[0].activeCell = "A1"
+        ws.sheet_view.selection[0].sqref = "A1"
         
         # 10) Kaydet
         wb.save(output_path)
