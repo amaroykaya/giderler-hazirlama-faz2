@@ -1032,9 +1032,9 @@ def clone_and_filter_workbook(master_path: Path, output_path: Path, target_tag: 
         ws.delete_cols(7, 2)
         log(f"[KLASOR-EXCEL] G ve H sütunları silindi (etiket: {target_tag})")
         
-        # 6) N'den sonraki kolonları kaldır (N=14, O'dan başla)
-        if ws.max_column > 14:  # N=14
-            ws.delete_cols(15, ws.max_column - 14)
+        # 6) L'den sonraki kolonları kaldır (L=12, M'dan başla)
+        if ws.max_column > 12:  # L=12
+            ws.delete_cols(13, ws.max_column - 12)
             log(f"[KLASOR-EXCEL] N'den sonraki kolonlar kaldırıldı (etiket: {target_tag})")
         
         # 6) Son veri satırını yeniden bul (satır silme sonrası)
